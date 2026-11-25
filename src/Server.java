@@ -1,351 +1,359 @@
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
-import java.io.PrintWriter;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.io.*;
+import java.net.*;
 
 /**
- * Servidor árbitro del tres en raya. Gestiona una única partida de dos jugadores.
+ * Servidor del tres en raya (arbitro de la partida).
+ * Solo admite dos jugadores. Uso: java Server [puerto]
  *
- * Uso: java Server [puerto]      (por defecto 5050)
- *
- * Concurrencia: cada cliente se atiende en su propio hilo, pero TODO el estado
- * de la partida vive en la clase Game, cuyos métodos son synchronized sobre una
- * única cerradura. Así, dos MOVE simultáneos se serializan y nunca se corrompe
- * el tablero ni se aceptan dos jugadas en el mismo turno.
+ * Cada cliente se atiende en su propio hilo (ClientHandler), pero todos
+ * comparten el estado de la partida (tablero, turno...). Para que dos hilos
+ * no lo toquen a la vez, los metodos que lo usan son "synchronized".
  */
 public class Server {
 
-    private static final int DEFAULT_PORT = 5050;
-    private static final int HANDSHAKE_TIMEOUT_MS = 15000;
+    static final int PUERTO_POR_DEFECTO = 5050;
 
-    private final Game game = new Game();
+    // Estado de la partida (compartido por los dos hilos)
+    static ClientHandler[] jugadores = new ClientHandler[2];
+    static char[] tablero = new char[9];
+    static char turno = 'X';
+    static final int ESPERANDO = 0;
+    static final int JUGANDO = 1;
+    static final int TERMINADA = 2;
+    static int estado = ESPERANDO;
 
     public static void main(String[] args) throws IOException {
-        int port = DEFAULT_PORT;
+        int puerto = PUERTO_POR_DEFECTO;
         if (args.length > 0) {
-            try {
-                port = Integer.parseInt(args[0]);
-            } catch (NumberFormatException e) {
-                System.err.println("Puerto no válido: " + args[0]);
-                return;
-            }
+            puerto = Integer.parseInt(args[0]);
         }
-        new Server().run(port);
-    }
+        vaciarTablero();
 
-    private void run(int port) throws IOException {
-        try (ServerSocket serverSocket = new ServerSocket(port)) {
-            log("Servidor escuchando en el puerto " + port);
-            while (true) {
-                Socket socket = serverSocket.accept();
-                Thread t = new Thread(() -> handleClient(socket), "cliente-" + socket.getRemoteSocketAddress());
-                t.setDaemon(true);
-                t.start();
-            }
+        ServerSocket serverSocket = new ServerSocket(puerto);
+        System.out.println("[servidor] Servidor escuchando en el puerto " + puerto);
+
+        while (true) {
+            Socket socket = serverSocket.accept();
+            ClientHandler hilo = new ClientHandler(socket);
+            hilo.setDaemon(true);
+            hilo.start();
         }
     }
 
-    /** Hilo de atención a un cliente: registro, bucle de lectura y limpieza. */
-    private void handleClient(Socket socket) {
-        Player player = null;
-        try {
-            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-            PrintWriter out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true);
+    // ------------------------------------------------------------------
+    // Un hilo por cliente
+    // ------------------------------------------------------------------
+    static class ClientHandler extends Thread {
+        Socket socket;
+        PrintWriter out;
+        String nombre;
+        char marca;
+        boolean dentro = false;       // true cuando ya esta sentado en la partida
+        boolean quiereRevancha = false;
 
-            // Registro: el primer mensaje debe ser PLAY <nombre>. Con timeout para no
-            // dejar hilos colgados con conexiones que no dicen nada.
-            socket.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
-            String line = in.readLine();
-            if (line == null) {
-                return;
-            }
-            String[] parts = line.trim().split("\\s+", 2);
-            if (!parts[0].equalsIgnoreCase("PLAY") || parts.length < 2 || parts[1].isBlank()) {
-                out.println("ERROR Se esperaba: PLAY <nombre>");
-                return;
-            }
-            socket.setSoTimeout(0);
-
-            player = new Player(sanitize(parts[1]), socket, out);
-            if (!game.join(player)) {
-                // Se leyó antes el PLAY del cliente para que el cierre sea limpio
-                // (sin datos pendientes de leer no hay RST que borre el FULL).
-                out.println("FULL");
-                log("Conexión rechazada (partida llena): " + socket.getRemoteSocketAddress());
-                try {
-                    socket.shutdownOutput();
-                } catch (IOException ignored) {
-                }
-                return;
-            }
-
-            while ((line = in.readLine()) != null) {
-                if (!game.handle(player, line.trim())) {
-                    break; // BYE
-                }
-            }
-        } catch (IOException e) {
-            // Caída brusca del cliente: se trata igual que una desconexión (finally).
-        } finally {
-            if (player != null && player.joined) {
-                game.leave(player);
-            }
-            try {
-                socket.close();
-            } catch (IOException ignored) {
-            }
-        }
-    }
-
-    /** Nombre de una sola palabra, para que el protocolo (separado por espacios) no sea ambiguo. */
-    private static String sanitize(String raw) {
-        String n = raw.trim().replaceAll("\\s+", "_");
-        return n.length() > 20 ? n.substring(0, 20) : n;
-    }
-
-    static void log(String msg) {
-        System.out.println("[servidor] " + msg);
-    }
-
-    // ------------------------------------------------------------------ Player
-
-    static class Player {
-        final String name;
-        final Socket socket;
-        private final PrintWriter out;
-        char mark;
-        boolean joined;
-
-        Player(String name, Socket socket, PrintWriter out) {
-            this.name = name;
+        ClientHandler(Socket socket) {
             this.socket = socket;
-            this.out = out;
         }
 
-        /** Dos hilos distintos pueden escribir al mismo jugador: se serializa. */
-        synchronized void send(String msg) {
-            out.println(msg);
+        // synchronized: dos hilos pueden escribirle al mismo jugador
+        synchronized void enviar(String mensaje) {
+            out.println(mensaje);
+        }
+
+        public void run() {
+            try {
+                BufferedReader in = new BufferedReader(
+                        new InputStreamReader(socket.getInputStream(), "UTF-8"));
+                out = new PrintWriter(
+                        new OutputStreamWriter(socket.getOutputStream(), "UTF-8"), true);
+
+                // El primer mensaje tiene que ser PLAY <nombre> (15 s como maximo)
+                socket.setSoTimeout(15000);
+                String linea = in.readLine();
+                if (linea == null) {
+                    return;
+                }
+                String[] partes = linea.trim().split(" ", 2);
+                if (!partes[0].equalsIgnoreCase("PLAY") || partes.length < 2
+                        || partes[1].trim().isEmpty()) {
+                    out.println("ERROR Se esperaba: PLAY <nombre>");
+                    return;
+                }
+                socket.setSoTimeout(0);
+
+                nombre = partes[1].trim().replace(" ", "_");
+                if (nombre.length() > 20) {
+                    nombre = nombre.substring(0, 20);
+                }
+
+                if (!entrar(this)) {
+                    out.println("FULL");
+                    socket.shutdownOutput();
+                    return;
+                }
+
+                // Bucle principal: leer lo que manda el jugador
+                while ((linea = in.readLine()) != null) {
+                    boolean seguir = procesar(this, linea.trim());
+                    if (!seguir) {
+                        break; // BYE
+                    }
+                }
+            } catch (IOException e) {
+                // el cliente se ha caido: se trata igual que una desconexion
+            } finally {
+                if (dentro) {
+                    salir(this);
+                }
+                try {
+                    socket.close();
+                } catch (IOException e) {
+                }
+            }
         }
     }
 
-    // -------------------------------------------------------------------- Game
+    // ------------------------------------------------------------------
+    // Logica de la partida (todo synchronized)
+    // ------------------------------------------------------------------
 
-    static class Game {
-        enum State { WAITING, PLAYING, FINISHED }
+    static void vaciarTablero() {
+        for (int i = 0; i < 9; i++) {
+            tablero[i] = '.';
+        }
+        turno = 'X';
+    }
 
-        private final List<Player> players = new ArrayList<>();
-        private final Set<Player> rematchVotes = new HashSet<>();
-        private final char[] board = new char[9];
-        private State state = State.WAITING;
-        private char turn = 'X';
+    static int contarJugadores() {
+        int n = 0;
+        for (int i = 0; i < 2; i++) {
+            if (jugadores[i] != null) {
+                n++;
+            }
+        }
+        return n;
+    }
 
-        Game() {
-            resetBoard();
+    static ClientHandler rivalDe(ClientHandler j) {
+        if (jugadores[0] == j) {
+            return jugadores[1];
+        }
+        return jugadores[0];
+    }
+
+    static void avisarATodos(String mensaje) {
+        for (int i = 0; i < 2; i++) {
+            if (jugadores[i] != null) {
+                jugadores[i].enviar(mensaje);
+            }
+        }
+    }
+
+    /** Sienta al jugador. Devuelve false si la partida esta llena. */
+    static synchronized boolean entrar(ClientHandler j) {
+        if (contarJugadores() >= 2 || estado != ESPERANDO) {
+            return false;
+        }
+        j.dentro = true;
+        if (jugadores[0] == null) {
+            jugadores[0] = j;
+            j.marca = 'X';
+            j.enviar("WAIT");
+            System.out.println("[servidor] " + j.nombre + " conectado como X, esperando rival");
+        } else {
+            jugadores[1] = j;
+            j.marca = 'O';
+            System.out.println("[servidor] " + j.nombre + " conectado como O, empieza la partida");
+            empezarPartida();
+        }
+        return true;
+    }
+
+    static void empezarPartida() {
+        vaciarTablero();
+        jugadores[0].quiereRevancha = false;
+        jugadores[1].quiereRevancha = false;
+        estado = JUGANDO;
+        jugadores[0].enviar("START " + jugadores[0].marca + " " + jugadores[1].nombre);
+        jugadores[1].enviar("START " + jugadores[1].marca + " " + jugadores[0].nombre);
+        avisarATodos("TURN X");
+    }
+
+    /** Procesa una linea del cliente. Devuelve false si hay que cerrar la conexion. */
+    static synchronized boolean procesar(ClientHandler j, String linea) {
+        if (linea.isEmpty()) {
+            return true;
+        }
+        String[] partes = linea.split(" ", 2);
+        String comando = partes[0].toUpperCase();
+        String argumento = "";
+        if (partes.length > 1) {
+            argumento = partes[1].trim();
         }
 
-        private void resetBoard() {
-            java.util.Arrays.fill(board, '.');
-            turn = 'X';
+        if (comando.equals("MOVE")) {
+            mover(j, argumento);
+        } else if (comando.equals("REMATCH")) {
+            revancha(j);
+        } else if (comando.equals("BYE")) {
+            return false;
+        } else {
+            j.enviar("ERROR Comando desconocido: " + comando);
+        }
+        return true;
+    }
+
+    static void mover(ClientHandler j, String argumento) {
+        if (estado == ESPERANDO) {
+            j.enviar("DENIED La partida aun no ha empezado");
+            return;
+        }
+        if (estado == TERMINADA) {
+            j.enviar("DENIED Partida terminada");
+            return;
+        }
+        if (j.marca != turno) {
+            j.enviar("DENIED No es tu turno");
+            return;
         }
 
-        /** Intenta sentar al jugador. False si la partida ya está completa. */
-        synchronized boolean join(Player p) {
-            if (players.size() >= 2 || state != State.WAITING) {
+        // Leer fila y columna: "2,3"
+        int fila;
+        int col;
+        try {
+            String[] numeros = argumento.split(",");
+            if (numeros.length != 2) {
+                throw new NumberFormatException();
+            }
+            fila = Integer.parseInt(numeros[0].trim());
+            col = Integer.parseInt(numeros[1].trim());
+        } catch (NumberFormatException e) {
+            j.enviar("DENIED Formato invalido, usa MOVE fila,col (1-3)");
+            return;
+        }
+        if (fila < 1 || fila > 3 || col < 1 || col > 3) {
+            j.enviar("DENIED Casilla fuera del tablero (fila y columna de 1 a 3)");
+            return;
+        }
+        int pos = (fila - 1) * 3 + (col - 1);
+        if (tablero[pos] != '.') {
+            j.enviar("DENIED Casilla ocupada");
+            return;
+        }
+
+        // Jugada valida
+        tablero[pos] = j.marca;
+        System.out.println("[servidor] " + j.nombre + " (" + j.marca + ") juega " + fila + "," + col);
+        avisarATodos("OK " + new String(tablero));
+
+        char ganador = buscarGanador();
+        if (ganador != ' ') {
+            estado = TERMINADA;
+            avisarATodos("END WIN " + ganador + " " + j.nombre);
+            System.out.println("[servidor] Fin de partida: gana " + j.nombre);
+        } else if (tableroLleno()) {
+            estado = TERMINADA;
+            avisarATodos("END DRAW");
+            System.out.println("[servidor] Fin de partida: empate");
+        } else {
+            if (turno == 'X') {
+                turno = 'O';
+            } else {
+                turno = 'X';
+            }
+            avisarATodos("TURN " + turno);
+        }
+    }
+
+    static void revancha(ClientHandler j) {
+        if (estado != TERMINADA) {
+            j.enviar("DENIED La revancha solo se pide al terminar la partida");
+            return;
+        }
+        ClientHandler rival = rivalDe(j);
+        if (rival == null) {
+            j.enviar("DENIED El rival ya no esta conectado");
+            return;
+        }
+        j.quiereRevancha = true;
+        if (rival.quiereRevancha) {
+            // Los dos quieren: se cambian las marcas para que empiece el otro
+            for (int i = 0; i < 2; i++) {
+                if (jugadores[i].marca == 'X') {
+                    jugadores[i].marca = 'O';
+                } else {
+                    jugadores[i].marca = 'X';
+                }
+            }
+            System.out.println("[servidor] Revancha aceptada por ambos");
+            empezarPartida();
+        } else {
+            j.enviar("WAIT");
+            rival.enviar("REMATCH");
+        }
+    }
+
+    /** Se llama cuando un jugador se va (BYE, caida o error). */
+    static synchronized void salir(ClientHandler j) {
+        if (jugadores[0] == j) {
+            jugadores[0] = null;
+        } else if (jugadores[1] == j) {
+            jugadores[1] = null;
+        } else {
+            return;
+        }
+        j.dentro = false;
+        System.out.println("[servidor] " + j.nombre + " desconectado");
+
+        ClientHandler otro = jugadores[0];
+        if (otro == null) {
+            otro = jugadores[1];
+        }
+
+        if (otro != null) {
+            otro.quiereRevancha = false;
+            if (estado == JUGANDO) {
+                estado = TERMINADA;
+                otro.enviar("END WIN " + otro.marca + " " + otro.nombre + " ABANDONO");
+            } else if (estado == TERMINADA) {
+                otro.enviar("LEFT");
+            }
+        } else {
+            // No queda nadie: la sala vuelve a estar libre
+            estado = ESPERANDO;
+            vaciarTablero();
+            System.out.println("[servidor] Sala vacia, lista para una nueva partida");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Comprobaciones del tablero
+    // ------------------------------------------------------------------
+
+    static boolean tableroLleno() {
+        for (int i = 0; i < 9; i++) {
+            if (tablero[i] == '.') {
                 return false;
             }
-            p.joined = true;
-            players.add(p);
-            if (players.size() == 1) {
-                p.mark = 'X';
-                p.send("WAIT");
-                log(p.name + " conectado como X, esperando rival");
-            } else {
-                p.mark = 'O';
-                log(p.name + " conectado como O, empieza la partida");
-                startGame();
-            }
-            return true;
         }
+        return true;
+    }
 
-        private void startGame() {
-            resetBoard();
-            rematchVotes.clear();
-            state = State.PLAYING;
-            for (Player p : players) {
-                p.send("START " + p.mark + " " + opponentOf(p).name);
-            }
-            broadcast("TURN X");
-        }
-
-        /** Procesa una línea del cliente. Devuelve false si debe cerrarse la conexión. */
-        synchronized boolean handle(Player p, String line) {
-            if (line.isEmpty()) {
-                return true;
-            }
-            String[] parts = line.split("\\s+", 2);
-            String cmd = parts[0].toUpperCase();
-            String arg = parts.length > 1 ? parts[1].trim() : "";
-            switch (cmd) {
-                case "MOVE":
-                    move(p, arg);
-                    return true;
-                case "REMATCH":
-                    rematch(p);
-                    return true;
-                case "BYE":
-                    return false;
-                default:
-                    p.send("ERROR Comando desconocido: " + cmd);
-                    return true;
-            }
-        }
-
-        private void move(Player p, String arg) {
-            if (state == State.WAITING) {
-                p.send("DENIED La partida aun no ha empezado");
-                return;
-            }
-            if (state == State.FINISHED) {
-                p.send("DENIED Partida terminada");
-                return;
-            }
-            if (p.mark != turn) {
-                p.send("DENIED No es tu turno");
-                return;
-            }
-            int row;
-            int col;
-            try {
-                String[] rc = arg.split("\\s*,\\s*");
-                if (rc.length != 2) {
-                    throw new NumberFormatException();
-                }
-                row = Integer.parseInt(rc[0].trim());
-                col = Integer.parseInt(rc[1].trim());
-            } catch (NumberFormatException e) {
-                p.send("DENIED Formato invalido, usa MOVE fila,col (1-3)");
-                return;
-            }
-            if (row < 1 || row > 3 || col < 1 || col > 3) {
-                p.send("DENIED Casilla fuera del tablero (fila y columna de 1 a 3)");
-                return;
-            }
-            int idx = (row - 1) * 3 + (col - 1);
-            if (board[idx] != '.') {
-                p.send("DENIED Casilla ocupada");
-                return;
-            }
-
-            board[idx] = p.mark;
-            log(p.name + " (" + p.mark + ") juega " + row + "," + col);
-            broadcast("OK " + new String(board));
-
-            char winner = winner();
-            if (winner != 0) {
-                state = State.FINISHED;
-                broadcast("END WIN " + winner + " " + p.name);
-                log("Fin de partida: gana " + p.name);
-            } else if (isFull()) {
-                state = State.FINISHED;
-                broadcast("END DRAW");
-                log("Fin de partida: empate");
-            } else {
-                turn = (turn == 'X') ? 'O' : 'X';
-                broadcast("TURN " + turn);
-            }
-        }
-
-        private void rematch(Player p) {
-            if (state != State.FINISHED) {
-                p.send("DENIED La revancha solo se pide al terminar la partida");
-                return;
-            }
-            if (players.size() < 2) {
-                p.send("DENIED El rival ya no esta conectado");
-                return;
-            }
-            rematchVotes.add(p);
-            if (rematchVotes.size() == 2) {
-                // Revancha: se intercambian las marcas para alternar quién empieza.
-                for (Player q : players) {
-                    q.mark = (q.mark == 'X') ? 'O' : 'X';
-                }
-                log("Revancha aceptada por ambos");
-                startGame();
-            } else {
-                p.send("WAIT");
-                opponentOf(p).send("REMATCH");
-            }
-        }
-
-        /** Se invoca al cerrarse la conexión de un jugador (BYE, caída o error). */
-        synchronized void leave(Player p) {
-            if (!players.remove(p)) {
-                return;
-            }
-            rematchVotes.remove(p);
-            log(p.name + " desconectado");
-            if (!players.isEmpty()) {
-                Player other = players.get(0);
-                if (state == State.PLAYING) {
-                    state = State.FINISHED;
-                    other.send("END WIN " + other.mark + " " + other.name + " ABANDONO");
-                } else if (state == State.FINISHED) {
-                    rematchVotes.clear();
-                    other.send("LEFT");
-                }
-            } else {
-                // Sala vacía: se reinicia para aceptar una nueva pareja de jugadores.
-                state = State.WAITING;
-                resetBoard();
-                rematchVotes.clear();
-                log("Sala vacia, lista para una nueva partida");
-            }
-        }
-
-        // ------------------------------------------------------------ helpers
-
-        private Player opponentOf(Player p) {
-            return players.get(0) == p ? players.get(1) : players.get(0);
-        }
-
-        private void broadcast(String msg) {
-            for (Player p : players) {
-                p.send(msg);
-            }
-        }
-
-        private boolean isFull() {
-            for (char c : board) {
-                if (c == '.') {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        private static final int[][] LINES = {
-                {0, 1, 2}, {3, 4, 5}, {6, 7, 8},
-                {0, 3, 6}, {1, 4, 7}, {2, 5, 8},
-                {0, 4, 8}, {2, 4, 6}
+    /** Devuelve 'X' u 'O' si hay tres en raya, o ' ' si nadie ha ganado. */
+    static char buscarGanador() {
+        int[][] lineas = {
+                {0, 1, 2}, {3, 4, 5}, {6, 7, 8},   // filas
+                {0, 3, 6}, {1, 4, 7}, {2, 5, 8},   // columnas
+                {0, 4, 8}, {2, 4, 6}               // diagonales
         };
-
-        /** Devuelve la marca ganadora o 0 si nadie ha hecho tres en línea. */
-        private char winner() {
-            for (int[] l : LINES) {
-                if (board[l[0]] != '.' && board[l[0]] == board[l[1]] && board[l[1]] == board[l[2]]) {
-                    return board[l[0]];
-                }
+        for (int i = 0; i < lineas.length; i++) {
+            char a = tablero[lineas[i][0]];
+            char b = tablero[lineas[i][1]];
+            char c = tablero[lineas[i][2]];
+            if (a != '.' && a == b && b == c) {
+                return a;
             }
-            return 0;
         }
+        return ' ';
     }
 }
